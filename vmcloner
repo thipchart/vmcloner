@@ -1,0 +1,586 @@
+#!/usr/bin/python
+#
+# Copyright (c) 2015 by Parinya Thipchart <thipchart@gmail.com>
+#
+##################################################################
+
+import os
+import sys
+import atexit
+import argparse
+import yaml
+import getpass
+import random
+import time
+import copy
+
+# Work arund for SSL self-signed and warning!
+import ssl
+import requests
+# End work around
+
+from pyVim import connect
+from pyVmomi import vmodl
+from pyVmomi import vim
+
+APP_NAME = 'vmcloner'
+
+def get_args():
+    '''Geting program options/arguments'''
+
+    parser = argparse.ArgumentParser(description='Creating one or more VMware Linux VMs from template(s) according to a specs file')
+    parser.add_argument('-c', '--config', help='Config file path', type=str)
+    parser.add_argument('-u', '--username', help='Username to connect to a vCenter', type=str)
+    parser.add_argument('-s', '--vcenter', required=True, help='vCenter to connect to', type=str)
+    parser.add_argument('-f', '--specs', required=True, help='VM specs file', type=str)
+    args = parser.parse_args()
+
+    return args
+
+def get_yaml_data(yaml_file):
+    '''Parse a YAML file and return a data object'''
+    
+    try:
+        yml = open(yaml_file)
+    except IOError:
+        sys.stderr.write('Error: cannot open {}.\n'.format(yaml_file)) 
+        return -1
+
+    data = yaml.load(yml)
+    yml.close()
+
+    return data
+
+
+def wait_for_task(task):
+    ''' wait for a vCenter task to finish '''
+
+    while task.info.state == vim.TaskInfo.State.running:
+        time.sleep(2)
+
+    if task.info.state == vim.TaskInfo.State.success:
+        print 'Done'
+        return task.info.result
+    else:
+        print 'Failed => {}'.format(task.info.error.msg)
+
+def get_object(content, vimtype, name):
+    '''
+    Return an object by name, if name is None the
+    first found object is returned
+    '''
+    obj = None
+    container = content.viewManager.CreateContainerView(
+        content.rootFolder, vimtype, True)
+    for c in container.view:
+        if name:
+            if c.name == name:
+                obj = c
+                break
+        else:
+            obj = c
+            break
+
+    return obj
+
+def get_all_objects(content, vimtype):
+    '''Get all the vsphere objects associated with a given type'''
+
+    obj = {}
+    container = content.viewManager.CreateContainerView(content.rootFolder, vimtype, True)
+    for c in container.view:
+        obj.update({c: c.name})
+    return obj
+
+
+def datacenter_exist(si, datacenter_name = None):
+    '''Check if there is a datacenter at all'''
+
+    content = si.RetrieveContent()
+    datacenter = get_object(content, [vim.Datacenter], datacenter_name)
+    return bool(datacenter)
+
+
+def clone_vm(si, default, vm):
+    '''Clone virtual machine from a template'''
+
+    # Check if there is vm name provided?
+    if not vm.get('name'):
+        sys.stderr.write('Error: no VM name specified.\n')
+        return
+
+    content = si.RetrieveContent()
+
+    # Check if the VM with vm['name'] already exist.
+    if get_object(content, [vim.VirtualMachine], vm['name']):
+        sys.stderr.write('Error: VM [{}] is already exist.\n'.format(vm['name']))
+        return
+    
+    # Get a template to clone
+    if vm.has_key('template'):
+        template = get_object(content, [vim.VirtualMachine], vm['template'])
+    elif default['template']:
+        template = get_object(content, [vim.VirtualMachine], default['template'])
+    else:
+        sys.stderr.write('Error: invalid VM template specified.\n')
+        return
+
+    # Sending a message we are going to clone now
+    sys.stdout.write('\n- Cloning from [{}] to [{}] ... '.format(template.name, vm['name']))
+    sys.stdout.flush()
+
+    # Get datacenter where the VM will be created
+    if vm.has_key('datacenter'):
+        datacenter = get_object(content, [vim.Datacenter], vm['datacenter'])
+
+    else:
+    # datacenter has been defined in a global config file?
+    # If no datacenter defined, use the first datacenter found
+        datacenter = get_object(content, [vim.Datacenter], default.get('datacenter'))
+
+    # Do we really have a valid datacenter object?
+    if not datacenter:
+        sys.stderr.write('Error: no datacenter name "{}" found.\n'.format(vm.get('datacenter', default['datacenter'])))
+        return
+
+    # Get a folder where to create the VM
+    # Use a folder specified with VM config first if defines
+    # Else use a global VM folder if defines
+    # Otherwise, use the root folder in the datacenter
+
+    vm_folder = get_object(content, [vim.Folder], vm.get('folder',default['folder']))
+    if not vm_folder:
+        vm_folder = datacenter.vmFolder
+
+    # If no cluster defined, use the default cluster. If None, use the first cluster found
+    cluster = get_object(content, [vim.ClusterComputeResource], vm.get('cluster', default['cluster']))
+
+    # What host the new VM should be resided?
+    # If there is a host key/value in VM specs, we will use that.
+    # Else if there is a list of hosts defined in a configuration file, we will randomly pick a host from the list
+    # If all of them are None, we will leave it as is
+
+    # ESX host object
+    host = None
+    # ESX hostname
+    hostname = ''
+
+    if vm.has_key('host'):
+        hostname = vm.get('host').lower()
+    elif len(default['hosts']) > 0:
+        hostname = random.choice(default['hosts']).lower()
+
+    if hostname:
+        host = get_object(content, [vim.HostSystem], hostname)
+
+
+    # If there is resource pool define, use that
+    # It seemed like it always returns a resource pool even though we pass None object, so we need to do the check before calling get_object()
+
+    resource_pool = None
+    if vm.get('resource_pool') or default['resource_pool']:
+        resource_pool = get_object(content, [vim.ResourcePool], vm.get('resource_pool', default['resource_pool']))
+
+    # If specified both host and cluster, give host higher priority for now
+    # If resource pool are not defined, check if there is a host defined, then use root resource from the host
+    if host and not resource_pool:
+        # Look for compute resource that maches the hostname
+        compute_resources = datacenter.hostFolder.childEntity
+        compute = None
+        for h in compute_resources:
+            if h.name in hostname:
+                compute = h
+                break
+
+        if compute:
+            resource_pool = compute.resourcePool
+
+    # If no resource pool defined and there is a cluster defined, use the root resource pool from the cluster
+    elif cluster and not resource_pool:
+        resource_pool = cluster.resourcePool
+
+    # Get datastore where to create the VM on
+    # If no datastore specified, use the same datastore as the template
+
+    # FIX this!! need to support more disks , not just the first one :)
+    if vm.has_key('disks'):
+        datastore = get_object(content, [vim.Datastore], vm['disks'][0].get('datastore', default['disk']['datastore']))
+    else:
+        datastore = get_object(content, [vim.Datastore], default['disk']['datastore'])
+
+    if not datastore:
+        #datastore = get_object(content, [vim.Datastore], template.datastore[0].info.name)
+        sys.stderr.write('Error: invalid datastore provided.\n')
+        return
+
+    # Customize VM settings
+    device_changes = []
+    adapter_config = []
+
+    # Network device(s)
+    # Don't clone NICs
+    for device in template.config.hardware.device:
+        if hasattr(device, 'addressType'):
+            # this is a VirtualEthernetCard, so we'll delete it,
+            nic = vim.vm.device.VirtualDeviceSpec()
+            nic.operation = vim.vm.device.VirtualDeviceSpec.Operation.remove
+            nic.device = device
+            device_changes.append(nic)
+
+    # Create new NIC(s) according to each VM specs
+    if vm.has_key('networks'):
+        if vm['networks'].has_key('nics'):
+            for nic_device in vm['networks']['nics']:
+                nic = vim.vm.device.VirtualDeviceSpec()
+                # or edit if a device exists
+                nic.operation = vim.vm.device.VirtualDeviceSpec.Operation.add
+                driver = nic_device.get('driver', default['nic']['driver'])
+                if driver == 'pcnet':
+                    nic.device = vim.vm.device.VirtualPCNet32()
+                elif driver == 'e1000':
+                    nic.device = vim.vm.device.VirtualE1000()
+                elif driver == 'vmxnet2':
+                    nic.device = vim.vm.device.VirtualVmxnet2()
+                elif driver == "vmxnet3":
+                    nic.device = vim.vm.device.VirtualVmxnet3()
+                else:
+                    nic.device = vim.vm.device.VirtualPCNet32()
+
+                #nic.device = vim.vm.device.VirtualVmxnet3()
+                nic.device.wakeOnLanEnabled = True
+                nic.device.addressType = 'assigned'
+                #FIXME: 4000 seems to be the value to use for a vmxnet3 device, how about other driver??
+                #Or is it first device starts with 4000? next one is 4001, 4002 and so on??
+                nic.device.key = 4000
+                nic.device.deviceInfo = vim.Description()
+
+                network_name = nic_device.get('network', default['nic']['network'])
+                # Network type is 'standard' or 'dvs'
+                network_type = nic_device.get('network_type', default['nic']['network_type'])
+                if network_type == 'dvs':
+                    portgroup = get_object(content, [vim.dvs.DistributedVirtualPortgroup], network_name)
+                    dvs_port_connection = vim.dvs.PortConnection()
+                    dvs_port_connection.portgroupKey = portgroup.key
+                    dvs_port_connection.switchUuid = portgroup.config.distributedVirtualSwitch.uuid
+                    nic.device.backing = vim.vm.device.VirtualEthernetCard.DistributedVirtualPortBackingInfo()
+                    nic.device.backing.port = dvs_port_connection
+
+                if network_type == 'standard':
+                    nic.device.deviceInfo.label = 'Network Adapter {}'.format(int(nic_device['id']))
+                    nic.device.deviceInfo.summary = network_name
+                    nic.device.backing = vim.vm.device.VirtualEthernetCard.NetworkBackingInfo()
+                    nic.device.backing.network = get_object(content, [vim.Network], network_name)
+                    nic.device.backing.deviceName = network_name
+                    nic.device.backing.useAutoDetect = False
+
+                nic.device.connectable = vim.vm.device.VirtualDevice.ConnectInfo()
+                nic.device.connectable.startConnected = True
+                nic.device.connectable.allowGuestControl = True
+                device_changes.append(nic)
+
+                adapter_map = vim.vm.customization.AdapterMapping()
+                adapter_map.adapter = vim.vm.customization.IPSettings()
+
+                # Network settings (IP, netmask) at VMware level ...
+                if nic_device.get('ip') and nic_device.get('netmask', default['netmask']):
+                    #adapter_map = vim.vm.customization.AdapterMapping()
+                    #adapter_map.adapter = vim.vm.customization.IPSettings()
+                    adapter_map.adapter.ip = vim.vm.customization.FixedIp(ipAddress=nic_device.get('ip'))
+                    adapter_map.adapter.subnetMask = nic_device.get('netmask', default['netmask'])
+                    #adapter_config.append(adapter_map)
+
+                    # Set gateway
+                    try:
+                        gateway = nic_device.get('gateway')
+                        if gateway:
+                            adapter_map.adapter.gateway = gateway
+                    except:
+                        pass
+
+                else:
+                    adapter_map.adapter.ip = vim.vm.customization.DhcpIpGenerator()
+
+                adapter_config.append(adapter_map)
+
+    # VM (CPU and Memory configurations)
+    vm_config = vim.vm.ConfigSpec()
+    vm_config.numCPUs = int(vm.get('num_cpu', default['num_cpu']))
+    if vm_config.numCPUs <= 0:
+        vm_config.numCPUs = 1
+    vm_config.memoryMB = int(vm.get('memory_mb', default['memory_mb']))
+    vm_config.cpuHotAddEnabled = True
+    vm_config.memoryHotAddEnabled = True
+    vm_config.deviceChange = device_changes
+
+    # DNS config
+    dns_config = vim.vm.customization.GlobalIPSettings()
+    dns_config.dnsSuffixList = default['dns_domain']
+    dns_config.dnsServerList = default['dns_servers']
+    if vm.has_key('networks'):
+        if vm['networks'].has_key('dns_domain'):
+            dns_config.dnsSuffixList = vm['networks']['dns_domain']
+
+        if vm['networks'].has_key('dns_servers'):
+            dns_config.dnsServerList = vm['networks']['dns_servers']
+
+    # Hostname settings
+    hostname_config = vim.vm.customization.LinuxPrep()
+    hostname_config.domain = dns_config.dnsSuffixList
+    hostname_config.hostName = vim.vm.customization.FixedName()
+    hostname_config.hostName.name = vm['name']
+
+    custom_spec = vim.vm.customization.Specification()
+    custom_spec.nicSettingMap = adapter_config
+    custom_spec.globalIPSettings = dns_config
+    custom_spec.identity = hostname_config
+
+    # Relocate spec
+    relocate_spec = vim.vm.RelocateSpec()
+    relocate_spec.datastore = datastore
+    if resource_pool is not None:
+        relocate_spec.pool = resource_pool
+    if host:
+        relocate_spec.host = host
+
+    # Clone spec 
+    clone_spec = vim.vm.CloneSpec()
+    clone_spec.location = relocate_spec
+    clone_spec.config = vm_config
+    clone_spec.customization = custom_spec
+    clone_spec.template = False
+    clone_spec.powerOn = True
+
+    task = template.Clone(folder=vm_folder, name=vm['name'], spec=clone_spec)
+    new_vm = wait_for_task(task)
+
+
+    if new_vm and vm.has_key('disks'):
+
+        # Reconfigure disks
+        unit_number = 0
+        device_changes = []
+
+        sys.stdout.write('  * Configuring VM disk(s) for [{}] ... '.format(vm['name']))
+        sys.stdout.flush()
+        new_disks = copy.deepcopy(vm['disks'])
+
+        # Find SCSI controller
+        controller = None
+        for device in new_vm.config.hardware.device:
+            if isinstance(device, vim.vm.device.VirtualSCSIController):
+                controller = device
+                break
+
+        # Search old disks and expand size if needed
+        # FIXED?: Only expanding for now
+        for disk in vm['disks']:
+            for device in new_vm.config.hardware.device:
+                if hasattr(device.backing, 'fileName'):
+                    if device.deviceInfo.label == 'Hard disk {}'.format(disk['id']):
+                        unit_number += 1
+                        # unitNumber 7 used by controller
+                        if unit_number == 7:
+                            unit_number += 1
+
+
+                        size_gb = disk.get('size_gb', default['disk']['size_gb'])
+                        if size_gb is not None:
+                            capacity_in_kb = device.capacityInKB
+                            disk_size_gb = int(size_gb)
+                            new_disk_kb = disk_size_gb * 1024 * 1024
+
+                            if new_disk_kb > capacity_in_kb:
+                                disk_spec = vim.vm.device.VirtualDeviceSpec()
+                                disk_spec.operation = vim.vm.device.VirtualDeviceSpec.Operation.edit
+                                disk_spec.device = vim.vm.device.VirtualDisk()
+                                disk_spec.device.key = device.key
+                                disk_spec.device.backing = vim.vm.device.VirtualDisk.FlatVer2BackingInfo()
+                                disk_spec.device.backing.fileName = device.backing.fileName
+                                disk_spec.device.backing.diskMode = device.backing.diskMode
+                                disk_spec.device.controllerKey = device.controllerKey
+                                disk_spec.device.unitNumber = device.unitNumber
+                                disk_spec.device.capacityInKB = new_disk_kb
+                                device_changes.append(disk_spec)
+
+                        new_disks.pop(0)
+
+
+        # Adding new disks, most likely id is going to start with 2 cuz the main disk is 1
+        # So we will create [datastore] name/name_(id - 1).vmdk, id 2 would create name_1.vmdk
+        # name.vmdk is for id = 1
+        for disk in new_disks:
+            size_gb = disk.get('size_gb', default['disk']['size_gb'])
+            if size_gb is None:
+                continue
+
+            new_disk_kb = int(size_gb) * 1024 * 1024
+            disk_spec = vim.vm.device.VirtualDeviceSpec()
+            disk_spec.fileOperation = vim.vm.device.VirtualDeviceSpec.FileOperation.create
+            disk_spec.operation = vim.vm.device.VirtualDeviceSpec.Operation.add
+            disk_spec.device = vim.vm.device.VirtualDisk()
+            disk_spec.device.backing = vim.vm.device.VirtualDisk.FlatVer2BackingInfo()
+
+            datastore = get_object(content, [vim.Datastore], disk.get('datastore', default['disk']['datastore']))
+            if datastore is not None:
+                disk_spec.device.backing.datastore = datastore
+                disk_spec.device.backing.fileName = '[{}] {}/{}.vmdk'.format(disk['datastore'], vm['name'], vm['name'] + '_' + str(int(disk['id']) - 1) )
+
+            if disk.get('type', default['disk']['type']) == 'thin':
+                disk_spec.device.backing.thinProvisioned = True
+            disk_spec.device.backing.diskMode = 'persistent'
+            disk_spec.device.unitNumber = unit_number
+            disk_spec.device.capacityInKB = new_disk_kb
+            disk_spec.device.key = -100
+            #disk_spec.device.controllerKey = 1000
+            disk_spec.device.controllerKey = controller.key
+            #disk_spec.device.unitNumber = len(controller.device)
+            device_changes.append(disk_spec)
+            unit_number += 1
+            # unit_Number 7 used by controller
+            if unit_number == 7:
+                unit_number += 1
+
+        if device_changes:
+            spec = vim.vm.ConfigSpec()
+            spec.deviceChange = device_changes
+            task = new_vm.ReconfigVM_Task(spec = spec)
+            wait_for_task(task)
+
+
+def clone_vm_from_specs(si, config, vm_specs):
+    '''Create virtual machines from template(s) according to VM specificatins'''
+
+    if not datacenter_exist(si):
+        sys.stderr.write('Error: no datacenter created in your vSphere environment.\n')
+        sys.exit(-1)
+
+    # Collecting default information from config file
+
+    default = {}
+
+    default['datacenter'] = config.get('datacenter')
+    default['cluster'] = config.get('cluster')
+    default['resource_pool'] = config.get('resource_pool')
+    default['num_cpu'] = config.get('num_cpu', 1)
+    default['memory_mb'] = config.get('memory_mb', 1024)
+    default['template'] = config.get('template')
+    default['folder'] = config.get('folder')
+    default['hosts'] = config.get('hosts', [])
+    default['disk'] = {}
+    default['disk']['size_gb'] = 20
+    default['disk']['type'] = 'thick'
+    default['disk']['datastore'] = None
+
+    if config.has_key('disk'):
+        if config['disk'].has_key('size_gb'):
+            default['disk']['size_gb'] = int(config['disk']['size_gb'])
+
+        if config['disk'].has_key('type'):
+            default['disk']['type'] = config['disk']['type']
+
+        if config['disk'].has_key('datastore'):
+            default['disk']['datastore'] = config['disk']['datastore']
+
+    default['dns_domain'] = 'localdomain'
+    default['dns_servers'] = ['8.8.8.8', '8.8.4.4']
+    default['netmask'] = '255.255.255.0'
+    default['default_gateway'] = None
+
+    default['nic'] = {}
+
+    default['nic']['driver'] = 'vmxnet3'
+    default['nic']['network'] = 'VM Network'
+    default['nic']['network_type'] = 'standard'
+    default['nic']['type'] = 'Ethernet'
+    default['nic']['bootproto'] = 'none'
+    default['nic']['onboot'] = 'yes'
+    default['nic']['ipv6'] = 'yes'
+
+    if config.has_key('dns_domain'):
+        default['dns_domain'] = config['dns_domain']
+
+    if config.has_key('dns_servers'):
+        default['dns_servers'] = config['dns_servers']
+
+    if config.has_key('default_gateway'):
+        default['default_gateway'] = config['default_gateway']
+
+    if config.has_key('netmask'):
+        default['netmask'] = config['netmask']
+
+    if config.has_key('nic'):
+        if config['nic'].has_key('driver'):
+            default['nic']['driver'] = config['nic']['driver']
+
+        if config['nic'].has_key('network'):
+            default['nic']['network'] = config['nic']['network']
+
+        if config['nic'].has_key('network_type'):
+            default['nic']['network_type'] = config['nic']['network_type']
+
+        if config['nic'].has_key('type'):
+            default['nic']['type'] = config['nic']['type']
+
+        if config['nic'].has_key('bootproto'):
+            default['nic']['bootproto'] = config['nic']['bootproto']
+
+        if config['nic'].has_key('onboot'):
+            default['nic']['onboot'] = config['nic']['onboot']
+
+        if config['nic'].has_key('ipv6'):
+            default['nic']['ipv6'] = config['nic']['ipv6']
+
+    for vm in vm_specs:
+        clone_vm(si, default, vm)
+
+def main():
+    '''Start the program here'''
+
+    username = os.environ['LOGNAME']
+    config_file = os.environ['HOME'] + os.path.sep + '.{}.conf'.format(APP_NAME)
+
+    args = get_args()
+    if args.username:
+        username = args.username
+
+    if args.config:
+        config_file = args.config
+
+    if not os.path.isfile(config_file):
+        sys.stderr.write('Error: cannot open {}.\n'.format(config_file))
+        return -1
+
+    if not os.path.isfile(args.specs):
+        sys.stderr.write('Error: cannot open {}.\n'.format(args.specs))
+        return -1
+
+    try:
+        # Work around for python 2.7.9 SSL self-signed cert error
+        ssl._create_default_https_context = ssl._create_unverified_context
+        # Work around urllib self-signed cert warning after connect
+        requests.packages.urllib3.disable_warnings()
+        ###############################################################
+
+        si = connect.SmartConnect(host=args.vcenter,
+                                  user=username,
+                                  pwd=getpass.getpass(username + "'s password: "))
+
+        if not si:
+            sys.stderr.write('Error: cannot connect to {} using specified username and password.\n'.format(args.vcenter))
+            return -1
+
+        atexit.register(connect.Disconnect, si)
+
+    except vmodl.MethodFault, e:
+        sys.stderr.write('Error: {}\n'.format(e.msg))
+        return -1
+
+
+    clone_vm_from_specs(si, get_yaml_data(config_file), get_yaml_data(args.specs))
+    return 0
+
+
+if __name__ == '__main__':
+    main()
+
+

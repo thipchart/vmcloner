@@ -1,0 +1,107 @@
+---
+- name: vm1
+  num_cpu: 1
+  memory_mb: 1024
+  folder: 'Lab'
+  template: centos-6-x64-minimal
+  host: esx1.home.lab
+  disks:
+      - id: 1
+        size_gb: 20
+        type: thick
+        datastore: esx1-datastore1
+
+      - id: 2
+        size_gb: 40
+        type: thick
+        datastore: datastore1
+
+  networks:
+      dns_domain: home.lab
+      dns_servers:
+          - 8.8.8.8
+          - 8.8.4.4
+
+      default_gateway: 172.25.10.1
+
+      nics:
+          - id: 1
+            network: 'VMware Network'
+            network_type: standard
+            type: Ethernet
+            bootproto: none
+            onboot: yes
+            ip: 172.25.10.171
+            netmask: 255.255.255.0
+            gateway: 172.25.10.1
+            ipv6: yes
+
+          - id: 2
+            network: 'VM Network'
+            network_type: standard
+            ip: 192.168.2.101
+            netmask: 255.255.255.0
+            ipv6: no
+
+- name: vm2
+  num_cpu: 2
+  memory_mb: 2048
+  template: centos-6-x64-minimal
+  folder: OpenStack
+  host: esx2.home.lab
+  disks:
+      - id: 1
+        size_gb: 20
+        type: thick
+        datastore: esx2-datastore1
+
+      - id: 2
+        size_gb: 10
+        type: thick
+        datastore: datastore1
+
+  networks:
+      nics:
+          - id: 1
+            ip: 172.25.10.172
+            netmask: 255.255.255.0
+            gateway: 172.25.10.1
+            network: 'VMware Network'
+
+- name: vm3
+  num_cpu: 2
+  memory_mb: 1048
+  host: esx1.home.lab
+
+  disks:
+      - id: 1
+        size_gb: 20
+        datastore: esx1-datastore1
+
+  networks:
+      nics:
+          - id: 1
+            ip: 172.25.10.173
+            gateway: 172.25.10.1
+
+- name: vm4
+  host: esx2.home.lab
+  disks:
+      - id: 1
+        size_gb: 20
+        datastore: esx2-datastore1
+
+  networks:
+      nics:
+          - id: 1
+            ip: 172.25.10.174
+            gateway: 172.25.10.1
+
+- name: vm5
+  host: esx1.home.lab
+  networks:
+      nics:
+          - id: 1
+            ip: 172.25.10.175
+            gateway: 172.25.10.1
+
